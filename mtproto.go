@@ -144,6 +144,7 @@ type MTProto struct {
 	exported              bool
 	cdn                   bool
 	terminated            atomic.Bool
+	disconnected          atomic.Bool
 	senderCounters        sync.Map // map[int]int32 - tracks sender count per DC
 
 	connConfig ReconnectConfig
@@ -618,6 +619,9 @@ func (m *MTProto) connectWithRetry(ctx context.Context) error {
 		if m.terminated.Load() {
 			return fmt.Errorf("mtproto terminated during reconnection")
 		}
+		if m.disconnected.Load() {
+			return fmt.Errorf("mtproto disconnected during reconnection")
+		}
 
 		delay := min(time.Duration(1<<uint(attempt))*m.connConfig.BaseDelay, m.connConfig.MaxDelay)
 
@@ -637,6 +641,7 @@ func (m *MTProto) CreateConnection(withLog bool) error {
 	if m.terminated.Load() {
 		return fmt.Errorf("mtproto is terminated, cannot create connection")
 	}
+	m.disconnected.Store(false)
 	m.stopRoutines()
 
 	m.transportMu.Lock()
@@ -1067,6 +1072,7 @@ func (m *MTProto) stopRoutines() {
 }
 
 func (m *MTProto) Disconnect() error {
+	m.disconnected.Store(true)
 	m.tcpState.SetActive(false)
 	m.stopRoutines()
 	done := make(chan struct{})
@@ -1098,6 +1104,7 @@ func (m *MTProto) Disconnect() error {
 
 func (m *MTProto) Terminate() error {
 	m.terminated.Store(true)
+	m.disconnected.Store(true)
 	m.stopRoutines()
 	m.responseChannels.Close()
 
