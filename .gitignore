@@ -2,6 +2,7 @@
 /.idea
 *.yaml
 *_test.go
+!telegram/auth_qr_test.go
 *.txt
 *.txt.worktrees/
 更新.txt
