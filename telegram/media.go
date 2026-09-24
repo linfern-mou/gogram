@@ -27,6 +27,8 @@ import (
 
 	"github.com/amarnathcjd/gogram/internal/encoding/tl"
 	"github.com/amarnathcjd/gogram/internal/utils"
+
+	mtproto "github.com/amarnathcjd/gogram"
 )
 
 const (
@@ -1848,7 +1850,7 @@ func (j *downloadJob) cdnPool(ctx context.Context, dc int32) (*WorkerPool, error
 	if pool, ok := j.cdnPools[dc]; ok {
 		return pool, nil
 	}
-	conn, err := j.client.CreateExportedSender(ctx, int(dc), true, false)
+	conn, err := j.client.createExportedSender(ctx, int(dc), true, false)
 	if err != nil {
 		return nil, fmt.Errorf("creating cdn sender: %w", err)
 	}
@@ -2094,13 +2096,13 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 	if media {
 		cacheKey = mediaSenderCacheKey(int(dc))
 	}
-	count := 0
+	numCreate := 0
 	for _, worker := range c.exSenders.GetSenders(cacheKey) {
-		if count >= numWorkers {
+		if numCreate >= numWorkers {
 			break
 		}
 		w.AddWorker(worker)
-		count++
+		numCreate++
 	}
 
 	if numCreate == 0 {
@@ -2117,15 +2119,11 @@ func initializeWorkersWithMode(numWorkers int, dc int32, c *Client, w *WorkerPoo
 	}
 
 	if numCreate < numWorkers {
-		bgCtx := context.Background()
-		if len(ctx) > 0 && ctx[0] != nil {
-			bgCtx = ctx[0]
-		}
 		toCreate := numWorkers - numCreate
 		c.Log.Info(fmt.Sprintf("exporting senders: dc(%d) media(%v) - creating %d more (have %d, want %d total)", dc, media, toCreate, numCreate, numWorkers))
 		go func() {
 			for i := numCreate; i < numWorkers; i++ {
-				if bgCtx.Err() != nil {
+				if ctx.Err() != nil {
 					return
 				}
 				conn, err := createSender()

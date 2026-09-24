@@ -781,7 +781,7 @@ func (s *ExSender) ensureAlive(ctx context.Context) bool {
 	done := s.reconnecting
 	s.reconnectMu.Unlock()
 
-	_ = s.Reconnect(false)
+	_ = s.Reconnect(context.Background(), false)
 	alive := s.MTProto != nil && s.MTProto.IsTcpActive()
 
 	s.reconnectMu.Lock()
@@ -795,6 +795,12 @@ func (es *ExSender) GetLastUsedTime() time.Time {
 	es.lastUsedMu.Lock()
 	defer es.lastUsedMu.Unlock()
 	return es.lastUsed
+}
+
+func (es *ExSender) TouchLastUsed() {
+	es.lastUsedMu.Lock()
+	es.lastUsed = time.Now()
+	es.lastUsedMu.Unlock()
 }
 
 func NewExSenders() *ExSenders {
@@ -1022,10 +1028,11 @@ func (c *Client) createExportedSender(ctx context.Context, dcID int, cdn bool, m
 
 		c.Log.Debug("initializing exported sender")
 		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, err = exported.MakeRequestCtx(reqCtx, &InvokeWithLayerParams{
+		_, err = exported.MakeRequest(reqCtx, &InvokeWithLayerParams{
 			Layer: ApiVersion,
 			Query: initialReq,
 		})
+		cancel()
 
 		if err != nil {
 			lastError = fmt.Errorf("making initial request: %w", err)
@@ -1069,7 +1076,7 @@ func (c *Client) createExportedSender(ctx context.Context, dcID int, cdn bool, m
 }
 
 func (c *Client) exportAuthAuthorization(ctx context.Context, dcID int32) (*AuthExportedAuthorization, error) {
-	responseData, err := c.MTProto.MakeRequestCtx(ctx, &AuthExportAuthorizationParams{DcID: dcID})
+	responseData, err := c.MTProto.MakeRequest(ctx, &AuthExportAuthorizationParams{DcID: dcID})
 	if err != nil {
 		return nil, fmt.Errorf("sending AuthExportAuthorization: %w", err)
 	}

@@ -145,6 +145,8 @@ type CACHE struct {
 	lru           *list.List
 	lruIndex      map[cachePeerKey]*list.Element
 	peerUsernames map[cachePeerKey][]string
+	minChannels   map[int64]int64 // channel_id -> access_hash for min-peer channels
+	minUsers      map[int64]int64 // user_id -> access_hash for min-peer users
 }
 
 type CachedMedia struct {

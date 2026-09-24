@@ -785,6 +785,14 @@ func (m *MTProto) CreateConnection(parent context.Context, withLog, allowDisconn
 	m.ctxCancel = cancelfunc
 	m.ctxCancelMutex.Unlock()
 
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		cancelfunc()
+	}()
+
 	transportType := m.GetTransportType()
 	if withLog {
 		m.Logger.Info("connecting to %s (%s)", utils.FmtIP(m.GetAddr()), transportType)
@@ -1725,7 +1733,7 @@ messageTypeSwitching:
 		} else {
 			m.Logger.Trace("received pong")
 		}
-		_ = m.writeRPCResponse(int(message.MsgID), message)
+		_ = m.writeRPCResponse(message.MsgID, message)
 
 	case *objects.MsgsAck:
 		// do nothing
