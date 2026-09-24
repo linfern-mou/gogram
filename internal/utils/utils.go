@@ -6,16 +6,23 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/amarnathcjd/gogram/internal/encoding/tl"
+
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 )
 
 var (
@@ -56,6 +63,7 @@ type DC struct {
 }
 
 type DCOptions struct {
+	mu       sync.RWMutex
 	DCs      map[int][]DC
 	TestDCs  map[int]string
 	CDNDCs   map[int][]DC
@@ -63,12 +71,20 @@ type DCOptions struct {
 }
 
 func NewDCOptions() *DCOptions {
-	return &DCOptions{
+	DCList.mu.RLock()
+	defer DCList.mu.RUnlock()
+	options := &DCOptions{
 		DCs:      maps.Clone(DCList.DCs),
 		TestDCs:  maps.Clone(DCList.TestDCs),
 		CDNDCs:   maps.Clone(DCList.CDNDCs),
 		MediaDCs: maps.Clone(DCList.MediaDCs),
 	}
+	for _, dcs := range []map[int][]DC{options.DCs, options.CDNDCs, options.MediaDCs} {
+		for id, addrs := range dcs {
+			dcs[id] = slices.Clone(addrs)
+		}
+	}
+	return options
 }
 
 func (opt *DCOptions) SetDCs(dcs map[int][]DC, cdnDCs map[int][]DC) {
@@ -76,6 +92,14 @@ func (opt *DCOptions) SetDCs(dcs map[int][]DC, cdnDCs map[int][]DC) {
 }
 
 func (opt *DCOptions) SetAllDCs(dcs map[int][]DC, cdnDCs map[int][]DC, mediaDCs map[int][]DC) {
+	opt.mu.Lock()
+	defer opt.mu.Unlock()
+	if opt.DCs == nil {
+		opt.DCs = make(map[int][]DC)
+	}
+	if opt.CDNDCs == nil {
+		opt.CDNDCs = make(map[int][]DC)
+	}
 	for id, newDCs := range dcs {
 		opt.DCs[id] = mergeUnique(opt.DCs[id], newDCs)
 	}
@@ -114,6 +138,8 @@ func mergeUnique(existing, new []DC) []DC {
 }
 
 func (opt *DCOptions) GetCDNAddr(dc int) (string, bool) {
+	opt.mu.RLock()
+	defer opt.mu.RUnlock()
 	addrs, ok := opt.CDNDCs[dc]
 	if !ok || len(addrs) == 0 {
 		return "", false
@@ -122,6 +148,8 @@ func (opt *DCOptions) GetCDNAddr(dc int) (string, bool) {
 }
 
 func (opt *DCOptions) GetMediaAddr(dc int, ipv6 bool) (string, bool) {
+	opt.mu.RLock()
+	defer opt.mu.RUnlock()
 	addrs, ok := opt.MediaDCs[dc]
 	if !ok || len(addrs) == 0 {
 		return "", false
@@ -139,6 +167,8 @@ func (opt *DCOptions) GetMediaOrHostIP(dc int, test, ipv6 bool) string {
 }
 
 func (opt *DCOptions) GetHostIP(dc int, test, ipv6 bool) string {
+	opt.mu.RLock()
+	defer opt.mu.RUnlock()
 	if test {
 		if addr, ok := opt.TestDCs[dc]; ok {
 			return addr
@@ -154,18 +184,7 @@ func (opt *DCOptions) GetHostIP(dc int, test, ipv6 bool) string {
 }
 
 func GetDefaultHostIP(dc int, test, ipv6 bool) string {
-	if test {
-		if addr, ok := DCList.TestDCs[dc]; ok {
-			return addr
-		}
-	}
-
-	dcAddrs, ok := DCList.DCs[dc]
-	if !ok {
-		return ""
-	}
-
-	return selectDCAddr(dcAddrs, ipv6)
+	return DCList.GetHostIP(dc, test, ipv6)
 }
 
 func selectDCAddr(dcs []DC, preferIPv6 bool) string {
@@ -191,6 +210,13 @@ func selectDCAddr(dcs []DC, preferIPv6 bool) string {
 }
 
 func (opt *DCOptions) SearchAddr(addr string) int {
+	opt.mu.RLock()
+	defer opt.mu.RUnlock()
+	for dcID, host := range opt.TestDCs {
+		if host == addr {
+			return dcID
+		}
+	}
 	for dcID, addrs := range opt.DCs {
 		for _, dc := range addrs {
 			if dc.Addr == addr {
@@ -258,12 +284,18 @@ type UpdatesGetStateParams struct{}
 
 func NewMsgIDGenerator() func(timeOffset int64) int64 {
 	var (
-		mu        sync.Mutex
-		lastMsgID int64
+		mu             sync.Mutex
+		lastMsgID      int64
+		lastTimeOffset int64
 	)
 	return func(timeOffset int64) int64 {
 		mu.Lock()
 		defer mu.Unlock()
+
+		if timeOffset != lastTimeOffset {
+			lastMsgID = 0
+			lastTimeOffset = timeOffset
+		}
 
 		now_time := time.Now().Add(time.Duration(timeOffset) * time.Second)
 		now := now_time.UnixNano()
@@ -358,6 +390,15 @@ func MinSafeDuration(d int) time.Duration {
 func IsTransportError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// Socket errors vary by operating system and locale. Match the wrapped
+	// network error instead of depending only on its English error text.
+	var networkError *net.OpError
+	if errors.As(err, &networkError) {
+		return true
 	}
 	errStr := err.Error()
 	return strings.Contains(errStr, "use of closed network connection") ||
@@ -466,4 +507,28 @@ func (p *Proxy) ToURL() *url.URL {
 	}
 
 	return u
+}
+
+// AtomicWriteFile leaves the old file intact if encoding or writing fails.
+// The temporary file resides beside its destination so rename stays on one volume.
+func AtomicWriteFile(path string, mode fs.FileMode, write func(io.Writer) error) error {
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if err := f.Chmod(mode); err != nil {
+		return err
+	}
+	if err := write(f); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }

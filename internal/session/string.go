@@ -3,9 +3,11 @@
 package session
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -31,8 +33,8 @@ type StringSession struct {
 
 func NewStringSession(authKey, authKeyHash []byte, dcID int, ipAddr string, appID int32) *StringSession {
 	return &StringSession{
-		AuthKey:     authKey,
-		AuthKeyHash: authKeyHash,
+		AuthKey:     bytes.Clone(authKey),
+		AuthKeyHash: bytes.Clone(authKeyHash),
 		DcID:        dcID,
 		IpAddr:      ipAddr,
 		AppID:       appID,
@@ -53,14 +55,30 @@ func (s *StringSession) Encode() string {
 }
 
 func (s *StringSession) Decode(encoded string) error {
-	if strings.HasPrefix(encoded, sessionPrefix) {
+	if s == nil || len(encoded) > 8192 {
+		return ErrInvalidSession
+	}
+	var decoded StringSession
+	if err := decoded.decode(encoded); err != nil {
+		return err
+	}
+	credentials := &Session{Key: decoded.AuthKey, Hash: decoded.AuthKeyHash, Hostname: decoded.IpAddr, AppID: decoded.AppID}
+	if decoded.DcID < 0 || decoded.DcID > math.MaxInt32 || credentials.Validate() != nil {
+		return ErrInvalidSession
+	}
+	*s = decoded
+	return nil
+}
+
+func (s *StringSession) decode(encoded string) error {
+	if after, ok := strings.CutPrefix(encoded, sessionPrefix); ok {
 		// Decode modern json session
-		decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encoded, sessionPrefix))
+		decoded, err := base64.RawURLEncoding.DecodeString(after)
 		if err != nil {
 			return err
 		}
 
-		err = json.Unmarshal(decoded, &s)
+		err = json.Unmarshal(decoded, s)
 		if err != nil {
 			return err
 		}
@@ -68,46 +86,45 @@ func (s *StringSession) Decode(encoded string) error {
 		return nil
 	}
 
-	if strings.HasPrefix(encoded, sessionPrefixLegacy) {
-		// Decode legacy session with separators
-		decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(encoded, sessionPrefixLegacy))
+	if after, ok := strings.CutPrefix(encoded, sessionPrefixLegacy); ok {
+		decoded, err := base64.RawURLEncoding.DecodeString(after)
 		if err != nil {
 			return err
 		}
-		decodedString := string(decoded)
-		split := strings.Split(decodedString, sessionSeparator)
-		if len(split) != 5 {
-			// try again with "::" as a separator (backward compatibility)
-			split = strings.Split(decodedString, legacySeparator)
-		}
-		if len(split) != 5 {
-			return ErrInvalidSession
-		}
-		for i, v := range split {
-			switch i {
-			case 0:
-				s.AuthKey = []byte(v)
-			case 1:
-				s.AuthKeyHash = []byte(v)
-			case 2:
-				s.IpAddr = v
-			case 3:
-				dcId, err := strconv.Atoi(v)
-				if err != nil {
-					return err
-				}
-
-				s.DcID = dcId
-			case 4:
-				appId, err := strconv.ParseInt(v, 10, 32)
-				if err != nil {
-					return err
-				}
-
-				s.AppID = int32(appId)
+		for _, separator := range []string{sessionSeparator, legacySeparator} {
+			const keySize, hashSize = 256, 8
+			hashStart := keySize + len(separator)
+			hashEnd := hashStart + hashSize
+			if len(decoded) < hashEnd+len(separator) ||
+				string(decoded[keySize:hashStart]) != separator ||
+				string(decoded[hashEnd:hashEnd+len(separator)]) != separator {
+				continue
 			}
+			suffix := string(decoded[hashEnd+len(separator):])
+			appStart := strings.LastIndex(suffix, separator)
+			if appStart < 0 {
+				return ErrInvalidSession
+			}
+			dcStart := strings.LastIndex(suffix[:appStart], separator)
+			if dcStart < 0 {
+				return ErrInvalidSession
+			}
+			dcID, err := strconv.Atoi(suffix[dcStart+len(separator) : appStart])
+			if err != nil {
+				return err
+			}
+			appID, err := strconv.ParseInt(suffix[appStart+len(separator):], 10, 32)
+			if err != nil {
+				return err
+			}
+			s.AuthKey = bytes.Clone(decoded[:keySize])
+			s.AuthKeyHash = bytes.Clone(decoded[hashStart:hashEnd])
+			s.IpAddr = suffix[:dcStart]
+			s.DcID = dcID
+			s.AppID = int32(appID)
+			return nil
 		}
-		return nil
+		return ErrInvalidSession
 	}
 
 	return ErrInvalidSession

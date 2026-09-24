@@ -292,7 +292,7 @@ func (c *Client) Login(phoneNumber string, options ...*LoginOptions) (bool, erro
 		switch user := auth.User.(type) {
 		case *UserObj:
 			c.clientData.botAcc = user.Bot
-			go c.Cache.UpdateUser(user)
+			c.Cache.UpdateUser(user)
 			return true, nil
 
 		case *UserEmpty:
